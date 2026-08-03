@@ -1,3 +1,5 @@
+# Scavenger Trader
+
 Act as an expert Ruby developer who values straightforward and performant code.
 Automate a Crypto scalping trading strategy that targets consistent, small gains.
 

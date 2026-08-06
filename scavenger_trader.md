@@ -13,7 +13,7 @@ Write an executable Ruby script `scavenger_trader.rb` to trade ETH/BRL on Binanc
 The script must run the following logic in a continuous loop:
 
 1. **Buy Order Execution:**
-   * Market buy Crypto at current market price.
+   * Market buy Crypto.
    * Wait for the buy order to fill.
 
 2. **Sell Order Execution:**

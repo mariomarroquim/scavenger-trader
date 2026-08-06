@@ -10,7 +10,7 @@ require 'uri'
 SYMBOL = 'ETHBRL'.freeze
 BASE_ASSET = 'ETH'.freeze
 QUOTE_ASSET = 'BRL'.freeze
-BUY_RETRACEMENT_RATIO = 0.00382.freeze
+BUY_RETRACEMENT_RATIO = 0.00236.freeze
 SELL_PROFIT_RATIO = 0.00236.freeze
 
 PRICE_PRECISION = 2.freeze

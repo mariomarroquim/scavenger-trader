@@ -17,8 +17,8 @@ The script must run the following logic in a continuous loop:
    * Wait for the buy order to fill.
 
 2. **Sell Order Execution:**
-   * Limit sell crypto at the last order's average buy price increased by 0.236%.
-   * If this order doesn't fill after 5 hours, change its price to last order's avg. price + 0.175%.
+   * Limit sell crypto at the last order's average buy price increased by 0.236% (take profit).
+   * If unfilled after 5 hours, cancel and reprice at last avg. buy + 0.175% (stop loss).
    * Wait for the sell order to fill.
 
 3. **Loop & Error Handling:**

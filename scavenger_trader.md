@@ -9,7 +9,8 @@ Automate a crypto scalping trading strategy that targets consistent, small gains
 3. Repeat the buy/sell cycle indefinitely.
 
 ### Technical Requirements
-Write an executable Ruby script `scavenger_trader.rb` to trade ETH/BRL on Binance via REST API.
+Write an executable Ruby script named `scavenger_trader.rb` to trade ETH/BRL on Binance via REST API.
+If `scavenger_trader.rb` already exists, fully regenerate it from these specs (do not patch or extend the existing file).
 The script must run the following logic in a continuous loop:
 
 1. **Buy Order Execution:**

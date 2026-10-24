@@ -18,14 +18,14 @@ The script must run the following logic in a continuous loop:
 
 2. **Sell Order Execution:**
    * Limit sell crypto at the last order's average buy price increased by 0.236% (take profit).
-   * If unfilled after 5 hours, cancel and reprice at last avg. buy + 0.175% (stop loss).
+   * If unfilled after 1 hour, cancel and reprice at last avg. buy + 0.175% (stop loss).
    * Wait for the sell order to fill.
 
 3. **Loop & Error Handling:**
    * Run the buy/sell cycle indefinitely.
    * Limit all REST API requests to 1 per second.
    * Keep skipping the buy/sell cycle if there are no available funds.
-   * If the script fails for network reasons, retry requests after 5 minutes for up to 5 hours.
+   * If the script fails for network reasons, retry requests after 5 minutes for up to 1 hour.
    * If the script fails for any other reason, log the error and exit the script.
 
 4. **Logging:**

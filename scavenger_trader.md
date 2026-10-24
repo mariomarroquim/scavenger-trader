@@ -4,11 +4,13 @@ Act as an expert Ruby developer who values straightforward and performant code.
 Automate a crypto scalping trading strategy that targets consistent, small gains.
 
 ## Strategy Overview
+
 1. Place a market buy order using the available fiat balance.
 2. Place a limit sell order using the available crypto balance.
 3. Repeat the buy/sell cycle indefinitely.
 
 ## Technical Requirements
+
 Write an executable Ruby script named `scavenger_trader.rb` to trade ETH/BRL on Binance via REST API.
 If `scavenger_trader.rb` already exists, delete it and fully regenerate it from these specs.
 The script must run the following logic in a continuous loop:
@@ -34,6 +36,23 @@ The script must run the following logic in a continuous loop:
    * Don't print messages to STDOUT (e.g., avoid using `puts`).
    * Append all log items to `scavenger_trader.log`, prefixed with date & time.
    * Append order details (type, side, symbol, price, quantity) once per status change.
+   * Follow this exact log format, since `status.sh` parses it:
+     * Start every log item with the date, time and Ruby `Logger` severity,
+       as in `2026-01-31 23:59:59 [INFO] message`.
+     * Use the `FATAL` severity for errors that end the script.
+     * Log these items exactly as shown, where `<...>` are placeholders:
+
+       ```text
+       Scavenger Trader started (implemented by <LLM model>).
+       Scavenger Trader ended.
+       Order <id> is <status>: type=<type> side=<side> symbol=<symbol> price=<price> quantity=<quantity>
+       Only <amount> <asset> available. Skipping cycles until the account is funded.
+       ```
+
+     * Log the ending item on every exit the script can handle, including signals.
+     * Use Binance's status, type and side values in order items, and the
+       average execution price once the order has executed.
+     * Log the no funds item once, until funds arrive.
 
 5. **API Authentication:**
    * Get API key and secret from environment variables `BINANCE_API_KEY` and `BINANCE_API_SECRET`.

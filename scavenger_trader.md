@@ -43,4 +43,3 @@ The script must run the following logic in a continuous loop:
    * Add the AI LLM model name and version to the script.
    * Use the `httparty` Ruby gem to perform all HTTP REST requests.
    * Round down prices and quantities to the maximum allowed precision for each asset.
-

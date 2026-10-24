@@ -3,14 +3,14 @@
 Act as an expert Ruby developer who values straightforward and performant code.
 Automate a crypto scalping trading strategy that targets consistent, small gains.
 
-### Strategy Overview
+## Strategy Overview
 1. Place a market buy order using the available fiat balance.
 2. Place a limit sell order using the available crypto balance.
 3. Repeat the buy/sell cycle indefinitely.
 
-### Technical Requirements
+## Technical Requirements
 Write an executable Ruby script named `scavenger_trader.rb` to trade ETH/BRL on Binance via REST API.
-If `scavenger_trader.rb` already exists, fully regenerate it from these specs (do not patch or extend the existing file).
+If `scavenger_trader.rb` already exists, delete it and fully regenerate it from these specs.
 The script must run the following logic in a continuous loop:
 
 1. **Buy Order Execution:**
@@ -26,13 +26,13 @@ The script must run the following logic in a continuous loop:
    * Run the buy/sell cycle indefinitely.
    * Limit all REST API requests to 1 per second.
    * Keep skipping the buy/sell cycle if there are no available funds.
-   * If the script fails for network reasons, retry requests after 5 minutes for up to 1 hour.
+   * If the script fails for network reasons, retry every 5 minutes for up to 1 hour.
    * If the script fails for any other reason, log the error and exit the script.
 
 4. **Logging:**
    * Log both script execution starting and ending.
    * Don't print messages to STDOUT (e.g., avoid using `puts`).
-   * Append all log items to `scavenger_trader.log`, prefixed with the current time.
+   * Append all log items to `scavenger_trader.log`, prefixed with date & time.
    * Append order details (type, side, symbol, price, quantity) once per status change.
 
 5. **API Authentication:**
@@ -43,3 +43,4 @@ The script must run the following logic in a continuous loop:
    * Add the AI LLM model name and version to the script.
    * Use the `httparty` Ruby gem to perform all HTTP REST requests.
    * Round down prices and quantities to the maximum allowed precision for each asset.
+

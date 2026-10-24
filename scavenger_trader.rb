@@ -1,280 +1,332 @@
 #!/usr/bin/env ruby
-# AI LLM Model: Gemini 1.5 Pro
+# frozen_string_literal: true
 
-require 'httparty'
-require 'openssl'
-require 'logger'
-require 'json'
 require 'bigdecimal'
 require 'bigdecimal/util'
+require 'httparty'
+require 'json'
+require 'logger'
+require 'openssl'
 require 'uri'
-require 'thread'
 
-# ==========================================
-# SETTINGS & GLOBAL CONSTANTS
-# ==========================================
-LLM_MODEL              = 'Gemini 1.5 Pro'.freeze
-SYMBOL                 = 'ETHBRL'.freeze
-BASE_ASSET             = 'ETH'.freeze
-QUOTE_ASSET            = 'BRL'.freeze
-TAKE_PROFIT_MULTIPLIER = BigDecimal('1.00236')
-STOP_LOSS_MULTIPLIER   = BigDecimal('1.00175')
-SELL_TIMEOUT_SECONDS   = 5 * 3600
-NETWORK_RETRY_INTERVAL = 300
-NETWORK_MAX_RETRY_TIME = 5 * 3600
+# ============================================================================
+# Settings
+# ============================================================================
+LLM_MODEL = 'Claude Opus 5'
 
-API_KEY                = ENV['BINANCE_API_KEY']
-API_SECRET             = ENV['BINANCE_API_SECRET']
-API_BASE_URL           = 'https://api.binance.com'.freeze
+API_BASE_URL = 'https://api.binance.com'
+API_KEY = ENV['BINANCE_API_KEY']
+API_SECRET = ENV['BINANCE_API_SECRET']
+API_RECV_WINDOW = 5_000
 
-# ==========================================
-# LOGGER SETUP
-# ==========================================
-# Logs strictly to a file with time prefix, no STDOUT
-LOGGER = Logger.new('scavenger_trader.log', 'monthly')
-LOGGER.formatter = proc do |severity, datetime, progname, msg|
-  "#{datetime.strftime('%Y-%m-%d %H:%M:%S')} [#{severity}] #{msg}\n"
+SYMBOL = 'ETHBRL'
+BASE_ASSET = 'ETH'
+QUOTE_ASSET = 'BRL'
+
+TAKE_PROFIT_RATE = BigDecimal('1.00236')
+STOP_LOSS_RATE = BigDecimal('1.00175')
+TAKE_PROFIT_TIMEOUT = 60 * 60
+
+REQUEST_INTERVAL = 1
+ORDER_POLL_INTERVAL = 5
+NO_FUNDS_INTERVAL = 60
+NETWORK_RETRY_INTERVAL = 5 * 60
+NETWORK_RETRY_TIMEOUT = 60 * 60
+
+LOG_FILE = 'scavenger_trader.log'
+
+LOGGER = Logger.new(LOG_FILE)
+LOGGER.formatter = proc do |severity, time, _program, message|
+  "#{time.strftime('%Y-%m-%d %H:%M:%S')} [#{severity}] #{message}\n"
 end
 
-# ==========================================
-# CORE ERROR HANDLING & RATE LIMITING
-# ==========================================
-class APIError < StandardError; end
+# ============================================================================
+# Binance REST API client
+# ============================================================================
 
-NETWORK_ERRORS = [
-  SocketError,
-  Timeout::Error,
-  SystemCallError,
-  OpenSSL::SSL::SSLError,
-  EOFError,
-  Net::ProtocolError,
-  Zlib::DataError,
-  Zlib::BufError,
-  JSON::ParserError
-].freeze
+# Raised when Binance answers with an error payload that will not fix itself.
+class BinanceError < StandardError; end
 
-module RateLimiter
-  @last_request_time = Time.at(0)
-  @mutex = Mutex.new
+# Raised for gateway hiccups and malformed payloads, which are worth retrying.
+class TransientError < StandardError; end
 
-  # Limits to exactly 1 request per second
-  def self.wait
-    @mutex.synchronize do
-      now = Time.now
-      elapsed = now - @last_request_time
-      sleep(1.0 - elapsed) if elapsed < 1.0
-      @last_request_time = Time.now
-    end
+# Raised once the network retry window is exhausted, ending the script.
+class NetworkError < StandardError; end
+
+class BinanceClient
+  RETRYABLE_ERRORS = [
+    EOFError,
+    Errno::ECONNREFUSED,
+    Errno::ECONNRESET,
+    Errno::EHOSTUNREACH,
+    Errno::ENETUNREACH,
+    Errno::ETIMEDOUT,
+    Net::ProtocolError,
+    OpenSSL::SSL::SSLError,
+    SocketError,
+    Timeout::Error,
+    TransientError
+  ].freeze
+
+  def initialize
+    @last_request_at = Time.at(0)
   end
-end
 
-module Binance
-  def self.request(method, endpoint, params = {})
-    RateLimiter.wait
+  def get(endpoint, params = {}) = request(:get, endpoint, params, signed: false)
 
-    headers = { 'X-MBX-APIKEY' => API_KEY }
-    params.reject! { |_, v| v.nil? }
+  def signed_get(endpoint, params = {}) = request(:get, endpoint, params)
 
-    if [:post, :delete, :put, :signed_get].include?(method)
-      params[:timestamp] = (Time.now.to_f * 1000).to_i
-      query_string = URI.encode_www_form(params)
-      signature = OpenSSL::HMAC.hexdigest('SHA256', API_SECRET, query_string)
-      params[:signature] = signature
-      query_string = URI.encode_www_form(params) # Re-encode including signature
-      http_method = method == :signed_get ? :get : method
-    else
-      query_string = URI.encode_www_form(params)
-      http_method = method
-    end
+  def post(endpoint, params = {}) = request(:post, endpoint, params)
 
-    url = "#{API_BASE_URL}#{endpoint}?#{query_string}"
-    response = HTTParty.send(http_method, url, headers: headers)
+  def delete(endpoint, params = {}) = request(:delete, endpoint, params)
+
+  private
+
+  # Retries transient network failures on a fixed interval, then gives up so the
+  # main loop can log the failure and exit.
+  def request(method, endpoint, params, signed: true)
+    deadline = Time.now + NETWORK_RETRY_TIMEOUT
 
     begin
-      parsed = JSON.parse(response.body)
-    rescue JSON::ParserError
-      raise JSON::ParserError, "Failed to parse Binance response (Gateway issue?): #{response.body[0..100]}..."
-    end
+      throttle
+      perform(method, endpoint, params, signed)
+    rescue *RETRYABLE_ERRORS => error
+      raise NetworkError, "#{error.class}: #{error.message}" if Time.now >= deadline
 
-    if response.code != 200
-      raise APIError, "Binance API Error (Code: #{response.code}): #{parsed['msg'] || parsed}"
+      LOGGER.warn("Network failure (#{error.class}: #{error.message}). Retrying in #{NETWORK_RETRY_INTERVAL}s.")
+      sleep NETWORK_RETRY_INTERVAL
+      retry
     end
+  end
 
-    parsed
+  def perform(method, endpoint, params, signed)
+    query = signed ? signed_query(params) : URI.encode_www_form(params.compact)
+    url = "#{API_BASE_URL}#{endpoint}?#{query}"
+    response = HTTParty.send(method, url, headers: { 'X-MBX-APIKEY' => API_KEY })
+
+    raise TransientError, "Binance is unavailable (HTTP #{response.code})." if response.code >= 500
+
+    body = parse(response)
+    raise BinanceError, "Binance refused the request (HTTP #{response.code}): #{body['msg'] || body}." if response.code != 200
+
+    body
+  end
+
+  def signed_query(params)
+    params = params.compact.merge(timestamp: (Time.now.to_f * 1000).to_i, recvWindow: API_RECV_WINDOW)
+    query = URI.encode_www_form(params)
+    signature = OpenSSL::HMAC.hexdigest('SHA256', API_SECRET, query)
+
+    "#{query}&signature=#{signature}"
+  end
+
+  def parse(response)
+    JSON.parse(response.body.to_s)
+  rescue JSON::ParserError
+    raise TransientError, "Binance returned an unreadable payload (HTTP #{response.code})."
+  end
+
+  # Binance throttles aggressively, so requests are spaced out globally.
+  def throttle
+    elapsed = Time.now - @last_request_at
+    sleep(REQUEST_INTERVAL - elapsed) if elapsed < REQUEST_INTERVAL
+    @last_request_at = Time.now
   end
 end
 
-def api_call
-  start_time = Time.now
-  begin
-    yield
-  rescue *NETWORK_ERRORS => e
-    elapsed = Time.now - start_time
-    if elapsed > NETWORK_MAX_RETRY_TIME
-      LOGGER.fatal("Network retry timeout reached (5 hours). Error: #{e.message}. Exiting.")
-      exit(1)
-    end
-    LOGGER.warn("Network error: #{e.class} - #{e.message}. Retrying in 5 minutes...")
-    sleep NETWORK_RETRY_INTERVAL
-    retry
-  rescue APIError, StandardError => e
-    LOGGER.fatal("Fatal error: #{e.class} - #{e.message}\n#{e.backtrace.join("\n")}. Exiting.")
-    exit(1)
+# ============================================================================
+# Trading strategy
+# ============================================================================
+SymbolRules = Struct.new(:tick_size, :step_size, :min_notional, :quote_precision)
+
+class ScavengerTrader
+  FINAL_STATUSES = %w[FILLED CANCELED REJECTED EXPIRED EXPIRED_IN_MATCH].freeze
+
+  def initialize
+    @client = BinanceClient.new
+    @logged_statuses = {}
+    @logged_no_funds = false
   end
-end
 
-# ==========================================
-# ORDER POLLING LOGIC
-# ==========================================
-def wait_for_order(order_id, timeout_seconds = nil)
-  start_time = Time.now
-  last_status = nil
+  def trade
+    loop { run_cycle }
+  end
 
-  loop do
-    order = api_call { Binance.request(:signed_get, '/api/v3/order', { symbol: SYMBOL, orderId: order_id }) }
-    status = order['status']
+  private
 
-    if status != last_status
-      LOGGER.info("Order Status Update: ID=#{order_id} | Status=#{status} | Type=#{order['type']} | Side=#{order['side']} | Symbol=#{order['symbol']} | Price=#{order['price']} | Qty=#{order['origQty']} | Executed=#{order['executedQty']}")
-      last_status = status
+  def run_cycle
+    rules = symbol_rules
+    budget = free_balance(QUOTE_ASSET).floor(rules.quote_precision)
+
+    return wait_for_funds(budget) if budget < rules.min_notional
+
+    @logged_no_funds = false
+    average_buy_price = buy(budget)
+
+    return if average_buy_price.nil?
+
+    sell(average_buy_price, rules)
+  end
+
+  # Spends the whole fiat balance at market price and reports the average price
+  # actually paid, which both sell prices are derived from.
+  def buy(budget)
+    order = @client.post('/api/v3/order', symbol: SYMBOL, side: 'BUY', type: 'MARKET', quoteOrderQty: format_decimal(budget))
+    order = await_fill(order)
+    executed_quantity = BigDecimal(order['executedQty'])
+
+    if executed_quantity.zero?
+      LOGGER.warn("Buy order #{order['orderId']} ended as #{order['status']} without any execution.")
+      return nil
     end
 
-    return order if %w[FILLED CANCELED REJECTED EXPIRED EXPIRED_IN_MATCH].include?(status)
+    BigDecimal(order['cummulativeQuoteQty']) / executed_quantity
+  end
 
-    if timeout_seconds && (Time.now - start_time) > timeout_seconds
-      LOGGER.info("Order ID=#{order_id} reached timeout of #{timeout_seconds}s. Cancelling...")
-      begin
-        api_call { Binance.request(:delete, '/api/v3/order', { symbol: SYMBOL, orderId: order_id }) }
-      rescue APIError => e
-        LOGGER.warn("Failed to cancel timeout order (may have already filled): #{e.message}")
+  def sell(average_buy_price, rules)
+    take_profit_price = round_down(average_buy_price * TAKE_PROFIT_RATE, rules.tick_size)
+    order = place_sell(take_profit_price, rules)
+
+    return if order.nil?
+
+    order = await_fill(order, timeout: TAKE_PROFIT_TIMEOUT)
+
+    return if order['status'] == 'FILLED'
+
+    # The take profit price never came, so the position is repriced closer to
+    # the buy price to free the funds for the next cycle.
+    stop_loss_price = round_down(average_buy_price * STOP_LOSS_RATE, rules.tick_size)
+    order = place_sell(stop_loss_price, rules)
+
+    await_fill(order) if order
+  end
+
+  def place_sell(price, rules)
+    quantity = round_down(free_balance(BASE_ASSET), rules.step_size)
+
+    if quantity * price < rules.min_notional
+      LOGGER.warn("Holding #{format_decimal(quantity)} #{BASE_ASSET}, which is below the minimum order value. Skipping the sell order.")
+      return nil
+    end
+
+    @client.post(
+      '/api/v3/order',
+      symbol: SYMBOL,
+      side: 'SELL',
+      type: 'LIMIT',
+      timeInForce: 'GTC',
+      quantity: format_decimal(quantity),
+      price: format_decimal(price)
+    )
+  end
+
+  # Polls until the order reaches a final status, cancelling it when a timeout
+  # is given and reached.
+  def await_fill(order, timeout: nil)
+    log_status(order)
+    deadline = timeout ? Time.now + timeout : nil
+
+    loop do
+      return order if FINAL_STATUSES.include?(order['status'])
+
+      if deadline && Time.now >= deadline
+        LOGGER.info("Order #{order['orderId']} is still open after #{timeout}s. Cancelling it.")
+        return cancel(order)
       end
-      # Fetch final state to guarantee we return the definitive status
-      return api_call { Binance.request(:signed_get, '/api/v3/order', { symbol: SYMBOL, orderId: order_id }) }
+
+      sleep ORDER_POLL_INTERVAL
+      order = @client.signed_get('/api/v3/order', symbol: SYMBOL, orderId: order['orderId'])
+      log_status(order)
+    end
+  end
+
+  def cancel(order)
+    canceled = @client.delete('/api/v3/order', symbol: SYMBOL, orderId: order['orderId'])
+    log_status(canceled)
+
+    canceled
+  rescue BinanceError => error
+    # Binance refuses to cancel an order that filled while the request was in
+    # flight, so the current state decides what happens next.
+    LOGGER.warn("Order #{order['orderId']} could not be cancelled: #{error.message}")
+    current = @client.signed_get('/api/v3/order', symbol: SYMBOL, orderId: order['orderId'])
+    log_status(current)
+
+    current
+  end
+
+  def symbol_rules
+    symbol = @client.get('/api/v3/exchangeInfo', symbol: SYMBOL)['symbols'].first
+    filters = symbol['filters'].to_h { |filter| [filter['filterType'], filter] }
+
+    SymbolRules.new(
+      BigDecimal(filters.dig('PRICE_FILTER', 'tickSize')),
+      BigDecimal(filters.dig('LOT_SIZE', 'stepSize')),
+      BigDecimal(filters.dig('NOTIONAL', 'minNotional')),
+      symbol['quoteAssetPrecision']
+    )
+  end
+
+  def free_balance(asset)
+    balance = @client.signed_get('/api/v3/account')['balances'].find { |item| item['asset'] == asset }
+
+    balance ? BigDecimal(balance['free']) : BigDecimal(0)
+  end
+
+  def wait_for_funds(budget)
+    unless @logged_no_funds
+      LOGGER.info("Only #{format_decimal(budget)} #{QUOTE_ASSET} available. Skipping cycles until the account is funded.")
+      @logged_no_funds = true
     end
 
-    sleep 5 # Poll gently to save API limits
+    sleep NO_FUNDS_INTERVAL
   end
+
+  def log_status(order)
+    id = order['orderId']
+
+    return if @logged_statuses[id] == order['status']
+
+    @logged_statuses[id] = order['status']
+    LOGGER.info(
+      "Order #{id} is #{order['status']}: type=#{order['type']} side=#{order['side']} " \
+      "symbol=#{order['symbol']} price=#{executed_price(order)} quantity=#{order['origQty']}"
+    )
+  end
+
+  # Market orders carry no price, so the price actually paid is reported.
+  def executed_price(order)
+    executed_quantity = BigDecimal(order['executedQty'].to_s)
+
+    return order['price'] if executed_quantity.zero?
+
+    format_decimal(BigDecimal(order['cummulativeQuoteQty']) / executed_quantity)
+  end
+
+  # Binance rejects any value finer than the asset precision, and rounding up
+  # could spend more than the account holds.
+  def round_down(value, increment) = (value / increment).floor * increment
+
+  def format_decimal(value) = value.to_s('F')
 end
 
-# ==========================================
-# MAIN EXECUTION LOOP
-# ==========================================
-if API_KEY.nil? || API_KEY.empty? || API_SECRET.nil? || API_SECRET.empty?
-  LOGGER.fatal("Missing BINANCE_API_KEY or BINANCE_API_SECRET environment variables. Exiting.")
-  exit(1)
+# ============================================================================
+# Entry point
+# ============================================================================
+LOGGER.info("Scavenger Trader started (implemented by #{LLM_MODEL}).")
+
+begin
+  raise 'Missing the BINANCE_API_KEY or BINANCE_API_SECRET environment variables.' if API_KEY.to_s.empty? || API_SECRET.to_s.empty?
+
+  ScavengerTrader.new.trade
+rescue SignalException => signal
+  # stop.sh terminates the script, which still deserves an ending log entry.
+  LOGGER.info("Scavenger Trader interrupted by #{signal.message}.")
+rescue StandardError => error
+  LOGGER.fatal("#{error.class}: #{error.message}")
+  LOGGER.fatal(error.backtrace.join("\n")) if error.backtrace
+  LOGGER.info('Scavenger Trader ended.')
+  exit 1
 end
 
-LOGGER.info("Scavenger Trader started. Powered by #{LLM_MODEL}")
-at_exit { LOGGER.info("Scavenger Trader ended.") }
-out_of_funds_logged = false
-
-loop do
-  # 1. Fetch live exchange precision data
-  info = api_call { Binance.request(:get, '/api/v3/exchangeInfo', { symbol: SYMBOL }) }
-  symbol_info = info['symbols'].find { |s| s['symbol'] == SYMBOL }
-
-  tick_size = BigDecimal(symbol_info['filters'].find { |f| f['filterType'] == 'PRICE_FILTER' }['tickSize'])
-  step_size = BigDecimal(symbol_info['filters'].find { |f| f['filterType'] == 'LOT_SIZE' }['stepSize'])
-  min_notional = BigDecimal(symbol_info['filters'].find { |f| f['filterType'] == 'NOTIONAL' }['minNotional'])
-
-  # 2. Check BRL Balance and Market Buy
-  account = api_call { Binance.request(:signed_get, '/api/v3/account') }
-  brl_asset = account['balances'].find { |b| b['asset'] == QUOTE_ASSET }
-  brl_balance = brl_asset ? BigDecimal(brl_asset['free']) : BigDecimal('0')
-
-  buy_qty = (brl_balance / tick_size).floor * tick_size # Format to quote precision
-
-  if buy_qty < min_notional
-    unless out_of_funds_logged
-      LOGGER.info("Insufficient #{QUOTE_ASSET} balance. Skipping cycle until funds are available.")
-      out_of_funds_logged = true
-    end
-    sleep 10
-    next
-  else
-    out_of_funds_logged = false
-  end
-
-  buy_params = {
-    symbol: SYMBOL,
-    side: 'BUY',
-    type: 'MARKET',
-    quoteOrderQty: buy_qty.to_s('F')
-  }
-
-  buy_order = api_call { Binance.request(:post, '/api/v3/order', buy_params) }
-  filled_buy = wait_for_order(buy_order['orderId'])
-
-  if filled_buy['status'] != 'FILLED'
-    LOGGER.warn("Buy order failed to fill. Final status: #{filled_buy['status']}. Restarting cycle.")
-    sleep 5
-    next
-  end
-
-  cumm_quote_qty = BigDecimal(filled_buy['cummulativeQuoteQty'])
-  executed_qty = BigDecimal(filled_buy['executedQty'])
-
-  if executed_qty.zero?
-    LOGGER.warn("Executed quantity is 0. Restarting cycle.")
-    sleep 5
-    next
-  end
-
-  avg_buy_price = cumm_quote_qty / executed_qty
-
-  # 3. Take Profit Limit Sell
-  account = api_call { Binance.request(:signed_get, '/api/v3/account') }
-  eth_asset = account['balances'].find { |b| b['asset'] == BASE_ASSET }
-  eth_balance = eth_asset ? BigDecimal(eth_asset['free']) : BigDecimal('0')
-
-  sell_qty = (eth_balance / step_size).floor * step_size
-  take_profit_price = (avg_buy_price * TAKE_PROFIT_MULTIPLIER / tick_size).floor * tick_size
-
-  if (sell_qty * take_profit_price) < min_notional
-    LOGGER.warn("Sell order notional value too small. Needs manual review. Skipping.")
-    sleep 60
-    next
-  end
-
-  sell_params = {
-    symbol: SYMBOL,
-    side: 'SELL',
-    type: 'LIMIT',
-    timeInForce: 'GTC',
-    quantity: sell_qty.to_s('F'),
-    price: take_profit_price.to_s('F')
-  }
-
-  sell_order = api_call { Binance.request(:post, '/api/v3/order', sell_params) }
-  final_sell = wait_for_order(sell_order['orderId'], SELL_TIMEOUT_SECONDS)
-
-  # 4. Fallback Logic (Stop Loss / Reprice) if timeout reached
-  if final_sell['status'] == 'CANCELED'
-    # Refresh balances in case of partial fills during the 5 hour window
-    account = api_call { Binance.request(:signed_get, '/api/v3/account') }
-    eth_asset = account['balances'].find { |b| b['asset'] == BASE_ASSET }
-    eth_balance = eth_asset ? BigDecimal(eth_asset['free']) : BigDecimal('0')
-
-    remaining_qty = (eth_balance / step_size).floor * step_size
-    stop_loss_price = (avg_buy_price * STOP_LOSS_MULTIPLIER / tick_size).floor * tick_size
-
-    if (remaining_qty * stop_loss_price) >= min_notional
-      fallback_params = {
-        symbol: SYMBOL,
-        side: 'SELL',
-        type: 'LIMIT',
-        timeInForce: 'GTC',
-        quantity: remaining_qty.to_s('F'),
-        price: stop_loss_price.to_s('F')
-      }
-
-      fallback_order = api_call { Binance.request(:post, '/api/v3/order', fallback_params) }
-      # Wait indefinitely for the stop loss fallback to fill
-      wait_for_order(fallback_order['orderId'])
-    else
-      LOGGER.warn("Remaining quantity after cancellation is below min notional limit. Skipping fallback.")
-    end
-  elsif final_sell['status'] != 'FILLED'
-    LOGGER.warn("Sell order ended in unexpected terminal status: #{final_sell['status']}.")
-  end
-end
+LOGGER.info('Scavenger Trader ended.')

@@ -27,18 +27,6 @@ never call the Binance order endpoints directly. Verify changes by reading the c
 `stop.sh` and `start.sh` both run `pkill ruby`, which kills every Ruby process on the machine,
 not just this one.
 
-## Layout
-
-| Path | Role |
-| --- | --- |
-| `scavenger_trader.md` | The spec/prompt. The source of truth for behaviour. |
-| `scavenger_trader.rb` | The generated, executable trading script. |
-| `start.sh` / `stop.sh` / `status.sh` | Start detached, kill, and tail recent log lines. |
-| `scavenger_trader.log` | Runtime log. Gitignored. |
-
-The script is organised in four sections: settings constants, `BinanceClient` (HTTP, signing,
-throttling, retries), `ScavengerTrader` (the buy/sell cycle), and the entry point.
-
 ## Conventions
 
 Readability first, then performance, then security. Comments explain *why* a decision was made,

@@ -22,6 +22,7 @@ The script must run the following logic in a continuous loop:
 2. **Sell Order Execution:**
    * Limit sell crypto at the last buy order avg. price + 0.225%.
    * If unfilled after an hour, change it to last buy order avg. price + 0.150%.
+   * If still unfilled after another hour, market sell all the available crypto balance.
    * Wait for the sell order to fill and restart the cycle indefinitely until exit conditions are met.
 
 3. **Loop & Error Handling:**

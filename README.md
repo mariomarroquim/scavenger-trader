@@ -6,8 +6,9 @@ Automate a Crypto scalping trading strategy that targets consistent, small gains
 
 1. Place a limit buy order with the available fiat balance at the current average price minus 0.075%, and wait for it to fill.
 2. Place a limit sell order with the available crypto balance at the buy's average price plus 0.225%.
-3. If the sell is still unfilled after an hour, reprice it to the buy's average price plus 0.150%, and wait for it to fill.
-4. Repeat the cycle indefinitely, skipping it while there are no available funds.
+3. If the sell is still unfilled after an hour, reprice it to the buy's average price plus 0.150%.
+4. If it is still unfilled after another hour, market sell the whole available crypto balance.
+5. Repeat the cycle indefinitely, skipping it while there are no available funds.
 
 ## Instructions
 

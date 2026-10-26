@@ -27,6 +27,7 @@ BUY_DISCOUNT_RATE = BigDecimal('0.99925')
 TAKE_PROFIT_RATE = BigDecimal('1.00225')
 FALLBACK_PROFIT_RATE = BigDecimal('1.0015')
 TAKE_PROFIT_TIMEOUT = 60 * 60
+FALLBACK_PROFIT_TIMEOUT = 60 * 60
 
 REQUEST_INTERVAL = 1
 ORDER_POLL_INTERVAL = 5
@@ -188,45 +189,63 @@ class ScavengerTrader
     return wait_for_funds(budget) if quantity * price < rules.min_notional
 
     @logged_no_funds = false
-    average_buy_price = average_price(await_fill(place_order(side: 'BUY', price:, quantity:)))
+    average_buy_price = average_price(await_fill(place_order(side: 'BUY', quantity:, price:)))
 
     sell(average_buy_price, rules) if average_buy_price
   end
 
   def sell(average_buy_price, rules)
     take_profit_price = round_down(average_buy_price * TAKE_PROFIT_RATE, rules.tick_size)
-    order = place_sell(take_profit_price, rules)
-
-    return if order.nil? || await_fill(order, timeout: TAKE_PROFIT_TIMEOUT)['status'] == 'FILLED'
+    return if sold?(place_limit_sell(take_profit_price, rules), timeout: TAKE_PROFIT_TIMEOUT)
 
     # The take profit price never came, so whatever is left of the position is
     # repriced closer to the buy price to free the funds for the next cycle.
     fallback_price = round_down(average_buy_price * FALLBACK_PROFIT_RATE, rules.tick_size)
-    order = place_sell(fallback_price, rules)
+    return if sold?(place_limit_sell(fallback_price, rules), timeout: FALLBACK_PROFIT_TIMEOUT)
 
+    # Two hours without reaching even the fallback price means the market moved
+    # against the position, so it is closed at any price instead of stalling the cycle.
+    order = place_market_sell(rules)
     await_fill(order) if order
   end
 
-  def place_sell(price, rules)
-    quantity = round_down(free_balance(BASE_ASSET), rules.step_size)
+  # A missing order means the remaining position is too small to sell, so there
+  # is nothing left to wait for.
+  def sold?(order, timeout:) = order.nil? || await_fill(order, timeout:)['status'] == 'FILLED'
 
-    if quantity * price < rules.min_notional
-      LOGGER.warn("Holding #{format_decimal(quantity)} #{BASE_ASSET}, which is below the minimum order value. Skipping the sell order.")
-      return nil
-    end
+  def place_limit_sell(price, rules)
+    quantity = sellable_quantity(price, rules)
 
-    place_order(side: 'SELL', price:, quantity:)
+    place_order(side: 'SELL', quantity:, price:) if quantity
   end
 
-  def place_order(side:, price:, quantity:)
+  # Market orders carry no price, so Binance's average price estimates whether
+  # the position clears the minimum order value.
+  def place_market_sell(rules)
+    quantity = sellable_quantity(current_average_price, rules)
+
+    place_order(side: 'SELL', quantity:) if quantity
+  end
+
+  def sellable_quantity(price, rules)
+    quantity = round_down(free_balance(BASE_ASSET), rules.step_size)
+
+    return quantity if quantity * price >= rules.min_notional
+
+    LOGGER.warn("Holding #{format_decimal(quantity)} #{BASE_ASSET}, which is below the minimum order value. Skipping the sell order.")
+    nil
+  end
+
+  # Omitting the price places a market order.
+  def place_order(side:, quantity:, price: nil)
     @client.post(
       '/api/v3/order',
       symbol: SYMBOL,
       side:,
-      type: 'LIMIT',
-      timeInForce: 'GTC',
+      type: price ? 'LIMIT' : 'MARKET',
+      timeInForce: price && 'GTC',
       quantity: format_decimal(quantity),
-      price: format_decimal(price)
+      price: price && format_decimal(price)
     )
   end
 

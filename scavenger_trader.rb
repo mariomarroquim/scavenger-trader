@@ -12,7 +12,7 @@ require 'uri'
 # ============================================================================
 # Settings
 # ============================================================================
-LLM_MODEL = 'Claude Opus 5'
+LLM_MODEL = 'Claude Opus 5.5'
 
 API_BASE_URL = 'https://api.binance.com'
 API_KEY = ENV['BINANCE_API_KEY']
@@ -23,8 +23,9 @@ SYMBOL = 'ETHBRL'
 BASE_ASSET = 'ETH'
 QUOTE_ASSET = 'BRL'
 
-TAKE_PROFIT_RATE = BigDecimal('1.00236')
-STOP_LOSS_RATE = BigDecimal('1.00175')
+BUY_DISCOUNT_RATE = BigDecimal('0.99925')
+TAKE_PROFIT_RATE = BigDecimal('1.00225')
+FALLBACK_PROFIT_RATE = BigDecimal('1.0015')
 TAKE_PROFIT_TIMEOUT = 60 * 60
 
 REQUEST_INTERVAL = 1
@@ -47,7 +48,7 @@ end
 # Raised when Binance answers with an error payload that will not fix itself.
 class BinanceError < StandardError; end
 
-# Raised for gateway hiccups and malformed payloads, which are worth retrying.
+# Raised for gateway hiccups, clock drift and malformed payloads, which are worth retrying.
 class TransientError < StandardError; end
 
 # Raised once the network retry window is exhausted, ending the script.
@@ -68,8 +69,11 @@ class BinanceClient
     TransientError
   ].freeze
 
+  TIMESTAMP_OUTSIDE_RECV_WINDOW = -1021
+
   def initialize
     @last_request_at = Time.at(0)
+    @clock_offset = nil
   end
 
   def get(endpoint, params = {}) = request(:get, endpoint, params, signed: false)
@@ -88,8 +92,9 @@ class BinanceClient
     deadline = Time.now + NETWORK_RETRY_TIMEOUT
 
     begin
+      query = signed ? signed_query(params) : URI.encode_www_form(params.compact)
       throttle
-      perform(method, endpoint, params, signed)
+      perform(method, "#{API_BASE_URL}#{endpoint}?#{query}")
     rescue *RETRYABLE_ERRORS => error
       raise NetworkError, "#{error.class}: #{error.message}" if Time.now >= deadline
 
@@ -99,26 +104,46 @@ class BinanceClient
     end
   end
 
-  def perform(method, endpoint, params, signed)
-    query = signed ? signed_query(params) : URI.encode_www_form(params.compact)
-    url = "#{API_BASE_URL}#{endpoint}?#{query}"
+  def perform(method, url)
     response = HTTParty.send(method, url, headers: { 'X-MBX-APIKEY' => API_KEY })
 
     raise TransientError, "Binance is unavailable (HTTP #{response.code})." if response.code >= 500
 
     body = parse(response)
-    raise BinanceError, "Binance refused the request (HTTP #{response.code}): #{body['msg'] || body}." if response.code != 200
 
-    body
+    return body if response.code == 200
+
+    # The local clock drifts away from Binance's (notably after the host
+    # sleeps), so the offset is measured again before the retry.
+    if body['code'] == TIMESTAMP_OUTSIDE_RECV_WINDOW
+      @clock_offset = nil
+      raise TransientError, "Binance refused the request timestamp: #{body['msg']}"
+    end
+
+    raise BinanceError, "Binance refused the request (HTTP #{response.code}): #{body['msg'] || body}."
   end
 
   def signed_query(params)
-    params = params.compact.merge(timestamp: (Time.now.to_f * 1000).to_i, recvWindow: API_RECV_WINDOW)
+    params = params.compact.merge(timestamp:, recvWindow: API_RECV_WINDOW)
     query = URI.encode_www_form(params)
     signature = OpenSSL::HMAC.hexdigest('SHA256', API_SECRET, query)
 
     "#{query}&signature=#{signature}"
   end
+
+  def timestamp
+    @clock_offset ||= server_clock_offset
+    current_millis + @clock_offset
+  end
+
+  def server_clock_offset
+    throttle
+    server_time = perform(:get, "#{API_BASE_URL}/api/v3/time")['serverTime']
+
+    server_time - current_millis
+  end
+
+  def current_millis = (Time.now.to_f * 1000).to_i
 
   def parse(response)
     JSON.parse(response.body.to_s)
@@ -157,46 +182,27 @@ class ScavengerTrader
   def run_cycle
     rules = symbol_rules
     budget = free_balance(QUOTE_ASSET).floor(rules.quote_precision)
+    price = round_down(current_average_price * BUY_DISCOUNT_RATE, rules.tick_size)
+    quantity = round_down(budget / price, rules.step_size)
 
-    return wait_for_funds(budget) if budget < rules.min_notional
+    return wait_for_funds(budget) if quantity * price < rules.min_notional
 
     @logged_no_funds = false
-    average_buy_price = buy(budget)
+    average_buy_price = average_price(await_fill(place_order(side: 'BUY', price:, quantity:)))
 
-    return if average_buy_price.nil?
-
-    sell(average_buy_price, rules)
-  end
-
-  # Spends the whole fiat balance at market price and reports the average price
-  # actually paid, which both sell prices are derived from.
-  def buy(budget)
-    order = @client.post('/api/v3/order', symbol: SYMBOL, side: 'BUY', type: 'MARKET', quoteOrderQty: format_decimal(budget))
-    order = await_fill(order)
-    executed_quantity = BigDecimal(order['executedQty'])
-
-    if executed_quantity.zero?
-      LOGGER.warn("Buy order #{order['orderId']} ended as #{order['status']} without any execution.")
-      return nil
-    end
-
-    BigDecimal(order['cummulativeQuoteQty']) / executed_quantity
+    sell(average_buy_price, rules) if average_buy_price
   end
 
   def sell(average_buy_price, rules)
     take_profit_price = round_down(average_buy_price * TAKE_PROFIT_RATE, rules.tick_size)
     order = place_sell(take_profit_price, rules)
 
-    return if order.nil?
+    return if order.nil? || await_fill(order, timeout: TAKE_PROFIT_TIMEOUT)['status'] == 'FILLED'
 
-    order = await_fill(order, timeout: TAKE_PROFIT_TIMEOUT)
-
-    return if order['status'] == 'FILLED'
-
-    # The take profit price never came, so the position is repriced closer to
-    # the buy price to free the funds for the next cycle.
-    stop_loss_price = round_down(average_buy_price * STOP_LOSS_RATE, rules.tick_size)
-    order = place_sell(stop_loss_price, rules)
+    # The take profit price never came, so whatever is left of the position is
+    # repriced closer to the buy price to free the funds for the next cycle.
+    fallback_price = round_down(average_buy_price * FALLBACK_PROFIT_RATE, rules.tick_size)
+    order = place_sell(fallback_price, rules)
 
     await_fill(order) if order
   end
@@ -209,10 +215,14 @@ class ScavengerTrader
       return nil
     end
 
+    place_order(side: 'SELL', price:, quantity:)
+  end
+
+  def place_order(side:, price:, quantity:)
     @client.post(
       '/api/v3/order',
       symbol: SYMBOL,
-      side: 'SELL',
+      side:,
       type: 'LIMIT',
       timeInForce: 'GTC',
       quantity: format_decimal(quantity),
@@ -224,7 +234,7 @@ class ScavengerTrader
   # is given and reached.
   def await_fill(order, timeout: nil)
     log_status(order)
-    deadline = timeout ? Time.now + timeout : nil
+    deadline = timeout && Time.now + timeout
 
     loop do
       return order if FINAL_STATUSES.include?(order['status'])
@@ -235,7 +245,7 @@ class ScavengerTrader
       end
 
       sleep ORDER_POLL_INTERVAL
-      order = @client.signed_get('/api/v3/order', symbol: SYMBOL, orderId: order['orderId'])
+      order = fetch_order(order)
       log_status(order)
     end
   end
@@ -249,11 +259,13 @@ class ScavengerTrader
     # Binance refuses to cancel an order that filled while the request was in
     # flight, so the current state decides what happens next.
     LOGGER.warn("Order #{order['orderId']} could not be cancelled: #{error.message}")
-    current = @client.signed_get('/api/v3/order', symbol: SYMBOL, orderId: order['orderId'])
+    current = fetch_order(order)
     log_status(current)
 
     current
   end
+
+  def fetch_order(order) = @client.signed_get('/api/v3/order', symbol: SYMBOL, orderId: order['orderId'])
 
   def symbol_rules
     symbol = @client.get('/api/v3/exchangeInfo', symbol: SYMBOL)['symbols'].first
@@ -266,6 +278,10 @@ class ScavengerTrader
       symbol['quoteAssetPrecision']
     )
   end
+
+  # Binance's rolling average smooths out momentary spikes in the order book,
+  # so a single outlier trade does not set the buy price.
+  def current_average_price = BigDecimal(@client.get('/api/v3/avgPrice', symbol: SYMBOL)['price'])
 
   def free_balance(asset)
     balance = @client.signed_get('/api/v3/account')['balances'].find { |item| item['asset'] == asset }
@@ -294,7 +310,19 @@ class ScavengerTrader
     )
   end
 
-  # Market orders carry no price, so the price actually paid is reported.
+  def average_price(order)
+    executed_quantity = BigDecimal(order['executedQty'])
+
+    if executed_quantity.zero?
+      LOGGER.warn("Order #{order['orderId']} ended as #{order['status']} without any execution.")
+      return nil
+    end
+
+    BigDecimal(order['cummulativeQuoteQty']) / executed_quantity
+  end
+
+  # Once an order executes, the average price paid is logged instead of the
+  # limit price, since partial fills can land at better prices.
   def executed_price(order)
     executed_quantity = BigDecimal(order['executedQty'].to_s)
 

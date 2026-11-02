@@ -1,6 +1,6 @@
 # Scavenger Trader
 
-A single-file Ruby script that trades ETH/BRL using a scalping strategy on the Binance platform.
+Scavenger Trader is a Ruby script that trades ETH/BRL using a scalping strategy on Binance.
 
 ## Project details
 

@@ -22,8 +22,8 @@ When regenerating, update `LLM_MODEL` to the model that produced the script.
 ### This script moves real money
 
 `./start.sh` places live limit buy, limit sell, and market sell orders with real funds on a real
-Binance account. Never run `start.sh`, `stop.sh`, or `ruby scavenger_trader.rb` to check your work, and
-never call the Binance order endpoints directly. Verify changes by reading the code.
+Binance account. Never run `start.sh`, `stop.sh`, or `ruby scavenger_trader.rb` to check your work,
+and never call the Binance order endpoints directly. Verify changes by reading the code.
 
 `stop.sh` and `start.sh` both run `pkill ruby`, which kills every Ruby process on the machine,
 not just this one.
@@ -52,4 +52,5 @@ the order may have filled in the meantime.
 - Don't add any new dependencies without asking first.
 - If the code changes, sync both `AGENTS.md` and `README.md` as well.
 - Run `ruby -c scavenger_trader.rb` to check for errors before every commit.
+- Don't commit and push changes unless explicity required.
 - This project only uses the `main` branch; commit and push directly to it.

@@ -6,8 +6,7 @@ Scavenger Trader is a set of Ruby scripts that trade [ETH/BRL](https://www.binan
 
 1. Add Fiat funds to your Binance account.
 2. Set the `BINANCE_API_KEY` and `BINANCE_API_SECRET` environment variables.
-3. Run the script you want (e.g., `ruby scavenger_trader.rb`):
-
+3. Run the script you want (e.g., `ruby scavenger_trader.rb`).
 
 ## Support
 

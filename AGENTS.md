@@ -52,5 +52,5 @@ the order may have filled in the meantime.
 - Don't add any new dependencies without asking first.
 - If the code changes, sync both `AGENTS.md` and `README.md` as well.
 - Run `ruby -c scavenger_trader.rb` to check for errors before every commit.
-- Don't commit and push changes unless explicity required.
+- Don't commit and push changes unless explicitly required.
 - This project only uses the `main` branch; commit and push directly to it.
